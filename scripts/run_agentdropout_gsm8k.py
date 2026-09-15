@@ -22,6 +22,9 @@ graph/graph.py（arun / update_masks_dec / update_masks_diff）——机制与�
    Dropout      4 batch × 10 题（与阶段一同用 train 前 40 题），批末
                 opt.edge_reinforce；batch idx {1,3} 后各 opt.edge_dropout(rate)
                 一次（原版 if (i_batch+1)%2==0 and i_batch<4）；结束 save 落 state
+                （两阶段日程在 methods/prerun/agentdropout/trainer.py::AgentDropoutTrainer；
+                 本脚本只提供题池、rollout / reward / predict 注入与评测，经统一接口
+                 optimize_langgraph(mode="optimize") 驱动——训练循环跟方法走）
  决策          FinalRefer：全部轮次执行完后只跑一次（原版 arun 语义），system/user
                 拼法逐字复刻，汇总 5 个 agent 末轮输出（含被淘汰节点的 'None.'）
  打分          gsm_get_predict（原版抽取）+ float 相等比较
@@ -33,10 +36,10 @@ graph/graph.py（arun / update_masks_dec / update_masks_diff）——机制与�
     同款建图）：每轮把 realized 空间边按拓扑序实例化成契约链图——agent 节点挂
     AgentSpec 元数据（name=agent_{i}、meta.predecessors 通信前驱、meta.dropped 本轮
     被淘汰节点），state 的 outputs 以节点名作 key，A{i} 标识与节点名经 meta.label
-    解耦；成环时确定性破环（methods/prerun/agentprune.topological_order，与
+    解耦；成环时确定性破环（methods/prerun/graphops.topological_order，与
     run_agentprune_gsm8k.py 同款）。eval threshold 的确定性轮经本框架 prerun 统一
-    接口 optimize_langgraph(method="agentdropout", state_file=…, round=r) 逐轮挂载
-    （plugins/prerun/agentdropout_lg.py：realized_matrices(threshold) + meta.dropped
+    接口 optimize_langgraph(method="agentdropout", mode="apply", state_file=…, round=r) 逐轮挂载
+    （methods/prerun/agentdropout/optimizer.py：realized_matrices(threshold) + meta.dropped
     + rebuild 线性链）——过保真闸门（无终端出边、Kahn 链尾=终端）才走此路径，其余
     轮直构契约链图；两条途径共用同一拓扑排序，消息文本与调用序一致。
     FinalRefer 决策在全部轮次执行完后单独执行一次（不嵌进契约图——挂载器假定图
@@ -46,7 +49,7 @@ graph/graph.py（arun / update_masks_dec / update_masks_diff）——机制与�
   - 数据集用本框架 gsm8k benchmark loader 单文件分流：train 用前 40 题（两阶段共用，
     与代码事实一致），eval 取 train 之后；原版 train.jsonl/test 分开。
   - 评测 --state-file：threshold 模式 = σ(logit)>0.5 且未被剪的确定性实现
-    （plugins/prerun/agentdropout_lg.py 的 apply 挂载口径）；sample 模式 = 原版式
+    （methods/prerun/agentdropout/optimizer.py 的 mode="apply" 挂载口径）；sample 模式 = 原版式
     每 query 伯努利采样（原版评测 loop 采样执行）。无 state-file = FullConnected
     对照（确定性全图无环实现、无淘汰），method=agentdropout_full。
 
@@ -61,7 +64,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import subprocess
 import sys
@@ -75,14 +77,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agentdropout_gsm8k_prompts as P  # noqa: E402  vendored 原版 prompt 资产
-from lychee_mas.core.types import AgentSpec  # noqa: E402  节点契约（graphview）
+from lychee_mas.core.types import AgentSpec, TaskQuery  # noqa: E402  节点契约（graphview）
 from lychee_mas.eval import metrics as M  # noqa: E402
 from lychee_mas.eval.benchmarks import load as load_benchmark  # noqa: E402
 from lychee_mas.methods.prerun.agentdropout import (  # noqa: E402
     AgentDropoutOptimizer,
     acyclic_realization,
 )
-from lychee_mas.methods.prerun.agentprune import topological_order  # noqa: E402
+from lychee_mas.methods.prerun.agentdropout.trainer import (  # noqa: E402
+    PHASE2_BATCH,
+    PRUNE_BATCHES,
+    RolloutStats,
+    RoundPlan,
+    full_temporal_edges,
+)
+from lychee_mas.methods.prerun.graphops import topological_order  # noqa: E402
 
 # prerun 统一接缝（import 副作用即触发 pre_run_optimizer 注册；run_maspo_langgraph 同款）
 from lychee_mas.plugins.prerun import optimize_langgraph  # noqa: E402
@@ -91,9 +100,8 @@ from lychee_mas.plugins.prerun.graphview import extract_view  # noqa: E402
 QUESTION_SUFFIX = "\nGive the final numeric answer."  # 本框架 loader 附加，复现时剥掉
 N_AGENTS = 5                      # README 复现口径：--agent_nums 5
 AGENT_ROLES = list(P.GSM8K_ROLES)  # 原版 roles cycle，agent i → AGENT_ROLES[i % 4]
-PHASE1_BATCH = 20                 # 阶段一 2 batch × 20 题（原版 dec loop 硬编码 20）
-PHASE2_BATCH = 10                 # 阶段二 4 batch × 10 题（原版 diff loop 硬编码 10）
-PRUNE_BATCHES = (1, 3)            # 阶段二在哪几个 batch 后剪边（原版 (i_batch+1)%2==0）
+# 两阶段日程的常量（PHASE1_BATCH/PHASE2_BATCH/PRUNE_BATCHES 与批次数）跟训练循环同在
+# methods/prerun/agentdropout/trainer.py；本脚本只按需 import（config 快照要用其字面值）。
 
 
 class ChainState(TypedDict):
@@ -212,28 +220,8 @@ def decision_messages(question: str, outputs: Dict[int, str]) -> List[Dict[str, 
 
 
 # ========== LangGraph 执行：契约链图（graphview 节点契约）→ 逐轮 ainvoke + 末轮后决策 ==========
-
-@dataclass
-class QueryStats:
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    model_calls: int = 0
-    latency_s: float = 0.0
-
-
-@dataclass
-class RoundPlan:
-    """一轮执行的图：空间边（拓扑链）+ 时间边（读上一轮）+ 本轮被淘汰的节点（'None.'）。"""
-
-    spatial_edges: set
-    temporal_edges: set
-    skip_idx: Optional[int]
-
-
-def full_temporal_edges(n: int) -> set:
-    """固定全时间掩码的确定性无环实现（原版 optimized=False 的构造结果 = i<=j 含对角）。"""
-    return {(a, b) for a in range(n) for b in range(n) if a <= b}
-
+# RoundPlan / RolloutStats / full_temporal_edges 由 methods/prerun/agentdropout/trainer.py
+# 提供（与训练日程同源，两边口径一致）。
 
 def make_agent_specs(n_agents: int) -> List[AgentSpec]:
     """契约图节点画像（graphview 节点契约，run_maspo_langgraph.py 同款）。
@@ -259,7 +247,7 @@ def make_agent_specs(n_agents: int) -> List[AgentSpec]:
 def build_contract_app(chat: HFChat, specs: List[AgentSpec], order: List[int],
                        preds: Dict[int, set], prev_outputs: Dict[str, str],
                        temporal_edges: set, skip_idx: Optional[int],
-                       max_new_tokens: int, stats: QueryStats) -> Any:
+                       max_new_tokens: int, stats: RolloutStats) -> Any:
     """直构：把一轮 (order, preds) 实例化成契约链图并编译。
 
     preds/skip 写进 spec.meta（predecessors 按 idx 升序 = 旧 sorted(j) 序 → 消息
@@ -276,7 +264,7 @@ def build_contract_app(chat: HFChat, specs: List[AgentSpec], order: List[int],
 
 def make_base_graph(chat: HFChat, specs: List[AgentSpec], order: List[int],
                     prev_outputs: Dict[str, str], temporal_edges: set,
-                    max_new_tokens: int, stats: QueryStats) -> Any:
+                    max_new_tokens: int, stats: RolloutStats) -> Any:
     """契约基图（未编译）：线性链 order[0] → … → order[-1] → END，agent 节点挂
     metadata["agent_spec"]（graphview 节点契约）。节点函数运行时从共享 spec 读
     meta.predecessors（空间前驱，本轮已执行）与 meta.dropped（'None.' 不调 LLM）；
@@ -333,7 +321,7 @@ def make_base_graph(chat: HFChat, specs: List[AgentSpec], order: List[int],
 
 def decision_step(chat: HFChat, question: str, specs: List[AgentSpec],
                   outputs: Dict[str, str], max_new_tokens: int,
-                  stats: QueryStats) -> str:
+                  stats: RolloutStats) -> str:
     """FinalRefer 收尾：全部轮次执行完后只跑一次（原版 arun 语义）。
 
     决策节点不进契约图（挂载器假定图节点即 agent 节点、names 序 = mask 下标）——
@@ -387,13 +375,13 @@ def assert_contract_matches(graph: Any, n_agents: int, expected_preds: Dict[int,
 async def run_query(chat: HFChat, n_agents: int, question: str, plans: List[RoundPlan],
                     max_new_tokens: int, *,
                     plugin_state_file: Optional[str] = None
-                    ) -> Tuple[str, Dict[str, str], QueryStats]:
+                    ) -> Tuple[str, Dict[str, str], RolloutStats]:
     """按每轮 plan 执行 num_rounds 轮；全部轮后 FinalRefer 决策一次（原版 arun 语义）。
 
     每 (query, round) 把该轮 realized 空间边实例化成契约链图执行：
       - plugin_state_file（eval threshold）且过保真闸门 → 经本框架 prerun 统一入口
-        optimize_langgraph(method="agentdropout", state_file=…, round=r, rounds=…)
-        挂载（plugins/prerun/agentdropout_lg.py：threshold 矩阵 + meta.dropped +
+        optimize_langgraph(method="agentdropout", mode="apply", state_file=…, round=r,
+        rounds=…) 挂载（methods/prerun/agentdropout/optimizer.py：threshold 矩阵 + meta.dropped +
         rebuild 线性链），随即契约断言锁等价性（不符显式失败）；
       - 否则直构契约链图（build_contract_app：topological_order 定序 + spec.meta
         写 preds/dropped + 线性链）。
@@ -401,7 +389,7 @@ async def run_query(chat: HFChat, n_agents: int, question: str, plans: List[Roun
     序逐字一致；temporal 跨轮通道（prev_outputs）随循环闭包传递。每轮每 query 的
     specs 都是新造的（串扰防护）；compile 次数 = 每 (query, round) 一次，与旧版持平。
     """
-    stats = QueryStats()
+    stats = RolloutStats()
     prev_outputs: Dict[str, str] = {}
     final = ""
     outputs: Dict[str, str] = {}
@@ -413,7 +401,7 @@ async def run_query(chat: HFChat, n_agents: int, question: str, plans: List[Roun
         if expected_preds is not None:
             base = make_base_graph(chat, specs, list(range(n_agents)), prev_outputs,
                                    plan.temporal_edges, max_new_tokens, stats)
-            graph = optimize_langgraph(base, method="agentdropout",
+            graph = optimize_langgraph(base, method="agentdropout", mode="apply",
                                        state_file=plugin_state_file,
                                        round=r, rounds=len(plans))
             assert_contract_matches(graph, n_agents, expected_preds, plan.skip_idx)
@@ -464,111 +452,35 @@ def _train_pool(records: List[Dict[str, Any]], args: argparse.Namespace) -> List
     return records[:40]
 
 
-async def _run_phase1_batch(chat: HFChat, opt: AgentDropoutOptimizer, batch,
-                            args: argparse.Namespace) -> tuple:
-    """阶段一一个 batch（20 题）：逐题逐轮 sample_skip 执行（被跳节点 'None.'）。"""
-    grad_batch: List[Tuple[List[Tuple[int, set]], float]] = []
-    log: List[Dict[str, Any]] = []
-    solved = 0
-    for rec in batch:
-        per_round: List[Tuple[int, set]] = []
-        plans: List[RoundPlan] = []
-        for r in range(opt.rounds):
-            skip, edges = opt.sample_skip(r)  # 固定掩码全图的确定性无环实现上采样
-            per_round.append((skip, edges))
-            # 时间边同 ref dec 期构造：optimized=False + 全时间掩码 → i<=j（含对角）
-            plans.append(RoundPlan(spatial_edges=edges,
-                                   temporal_edges=(full_temporal_edges(opt.n)
-                                                   if r >= 1 else set()),
-                                   skip_idx=skip))
-        final, _outputs, stats = await run_query(
-            chat, opt.n, rec["question"], plans, args.max_new_tokens)
-        u = utility_of(final, rec["gold"])
-        solved += int(u)
-        grad_batch.append((per_round, u))
-        log.append({"phase": "node_dropout", "batch": batch[0]["_batch"],
-                    "skip": {r: s for r, (s, _e) in enumerate(per_round)},
-                    "utility": u, "pred": P.gsm_get_predict(final), "gold": rec["gold"],
-                    "prompt_tokens": stats.prompt_tokens,
-                    "completion_tokens": stats.completion_tokens,
-                    "model_calls": stats.model_calls})
-    return grad_batch, log, solved
-
-
-async def _run_phase2_batch(chat: HFChat, opt: AgentDropoutOptimizer, batch,
-                            args: argparse.Namespace) -> tuple:
-    """阶段二一个 batch（10 题）：逐轮 sample_round 实现执行（skip_nodes 节点 'None.'）。"""
-    grad_batch: List[Tuple[List[Any], float]] = []
-    log: List[Dict[str, Any]] = []
-    solved = 0
-    for rec in batch:
-        reals = [opt.sample_round(r) for r in range(opt.rounds)]
-        plans = [RoundPlan(spatial_edges=re.spatial_edges, temporal_edges=re.temporal_edges,
-                           skip_idx=opt.skip_nodes.get(r))
-                 for r, re in enumerate(reals)]
-        final, _outputs, stats = await run_query(
-            chat, opt.n, rec["question"], plans, args.max_new_tokens)
-        u = utility_of(final, rec["gold"])
-        solved += int(u)
-        grad_batch.append((reals, u))
-        log.append({"phase": "edge_dropout", "batch": batch[0]["_batch"],
-                    "alive_edges": {r: len(re.spatial_edges) for r, re in enumerate(reals)},
-                    "utility": u, "pred": P.gsm_get_predict(final), "gold": rec["gold"],
-                    "prompt_tokens": stats.prompt_tokens,
-                    "completion_tokens": stats.completion_tokens,
-                    "model_calls": stats.model_calls})
-    return grad_batch, log, solved
-
-
 def train(args: argparse.Namespace, chat: HFChat) -> str:
+    """两阶段训练（循环在方法侧：methods/prerun/agentdropout/trainer.py）。
+
+    本脚本只提供「数据 + 生成后端」：题池（train 前 40 题）→ TaskQuery；``rollout``
+    （契约链图逐轮执行 + FinalRefer 决策 + token/调用记账）；``reward``（gsm_get_predict
+    + float 相等）；``predict``（train_log 的 pred 字段抽取器）。日程、RNG 消费序、落盘
+    与进度打印全在 ``AgentDropoutTrainer``；本函数经统一入口 ``optimize_langgraph
+    (mode="optimize")`` 驱动（methods/prerun/agentdropout/optimizer.py 的 AgentDropoutLG，
+    与 run_maspo_langgraph.py 同款路径），返回 state 产物路径。
+    """
     records = load_gsm8k_records(args.train_n)
     pool = _train_pool(records, args)
-    opt = make_optimizer(args)
-    log: List[Dict[str, Any]] = []
-
-    # ---- 阶段一：2 × 20 skip-REINFORCE → node_dropout ----
-    solved_1 = 0
-    for i_batch in range(2):
-        batch = pool[i_batch * PHASE1_BATCH:(i_batch + 1) * PHASE1_BATCH]
-        for rec in batch:
-            rec["_batch"] = i_batch
-        grad_batch, entries, solved = asyncio.run(
-            _run_phase1_batch(chat, opt, batch, args))
-        opt.skip_reinforce(grad_batch)  # 原版：批末 mean over batch 的 Adam 步
-        solved_1 += solved
-        log.extend(entries)
-        acc = solved_1 / ((i_batch + 1) * len(batch))
-        print(f"[node_dropout] batch {i_batch + 1}/2 running_acc={acc:.3f}")
-    skip_nodes = opt.node_dropout()  # 原版 update_masks_dec（两批后一次）
-    print(f"[node_dropout] done: skip_nodes={skip_nodes}")
-
-    # ---- 阶段二：4 × 10 边 REINFORCE，batch idx {1,3} 后各剪一次 ----
-    solved_2 = 0
-    for i_batch in range(4):
-        batch = pool[i_batch * PHASE2_BATCH:(i_batch + 1) * PHASE2_BATCH]
-        for rec in batch:
-            rec["_batch"] = i_batch
-        grad_batch, entries, solved = asyncio.run(
-            _run_phase2_batch(chat, opt, batch, args))
-        opt.edge_reinforce(grad_batch)
-        solved_2 += solved
-        log.extend(entries)
-        if i_batch in PRUNE_BATCHES:
-            pruned = opt.edge_dropout(args.pruning_rate)
-            alive = sum(1 for r in range(opt.rounds)
-                        for e, m in opt.spatial_masks[r].items()
-                        if m == 1 and e[0] != e[1])
-            print(f"[edge_dropout] prune @batch {i_batch + 1}: {pruned} "
-                  f"alive_spatial={alive}")
-        acc = solved_2 / ((i_batch + 1) * len(batch))
-        print(f"[edge_dropout] batch {i_batch + 1}/4 running_acc={acc:.3f}")
-
+    trainset = [TaskQuery(question=rec["question"], gold=rec["gold"]) for rec in pool]
     state_path = os.path.join(args.out_root or ".", "agentdropout_gsm8k_state.json")
-    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
-    opt.save(state_path)
-    with open(state_path.replace("_state.json", "_train_log.json"), "w") as f:
-        json.dump(log, f, indent=2)
-    print(f"[train] done: state -> {state_path}  skip_nodes={opt.skip_nodes}")
+
+    async def rollout(question: str, plans: List[RoundPlan]) -> Tuple[str, RolloutStats]:
+        final, _outputs, stats = await run_query(
+            chat, args.num_agents, question, plans, args.max_new_tokens)
+        return final, stats
+
+    # 载体图：训练不消费图（rollout 自行跑图），只需按契约图取 n_agents（节点不执行）
+    carrier = make_base_graph(chat, make_agent_specs(args.num_agents),
+                              list(range(args.num_agents)), {}, set(),
+                              args.max_new_tokens, RolloutStats())
+    optimize_langgraph(carrier, method="agentdropout", mode="optimize",
+                       state_file=state_path, trainset=trainset, rollout=rollout,
+                       reward=utility_of, predict=P.gsm_get_predict,
+                       lr=args.lr, seed=args.seed, rounds=args.num_rounds,
+                       pruning_rate=args.pruning_rate)
     return state_path
 
 

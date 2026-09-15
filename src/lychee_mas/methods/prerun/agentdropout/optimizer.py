@@ -26,18 +26,38 @@ experiments/run_gsm8k.py 的机制逐一对应）。与 AgentPrune 同族代码�
    （原版硬编码 5）；采样用实例内 seeded RNG（可复现）。
 
 时间边索引约定：``temporal_*[r]``（r ∈ 1..rounds-1）= 第 r-1 轮 → 第 r 轮的边
-（原版 ``temporal_logits[r-1]``）。图级挂载见 ``plugins/prerun/agentdropout_lg.py``；
-训练循环由实验脚本驱动，本类只负责「采样 / 更新 / 淘汰 / 产出实现矩阵」。
+（原版 ``temporal_logits[r-1]``）。
+
+本模块含**两层**（与 ``maspo/optimizer.py`` 同款：注册类在 methods，plugins 不留实现）：
+
+- ``AgentDropoutOptimizer``（``graph_pruner/agentdropout``）：引擎——采样 / 更新 / 淘汰 /
+  产出实现矩阵；**两阶段训练日程**在同包 ``trainer.py``（``AgentDropoutTrainer``）。
+- ``AgentDropoutLG``（``pre_run_optimizer/agentdropout``）：统一接口类（接缝），
+  ``mode="apply"`` 逐轮把训练产物挂到契约图上 / ``mode="optimize"`` 驱动 trainer 落盘。
+  **图级读写只经 ``plugins/prerun/graphview.py``**（函数内导入避免包内环）。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ...core.registry import REGISTRY
-from .agentprune import Edge, Realization, _Adam, full_connected_masks
+from ....core.registry import REGISTRY
+from ....core.types import TaskQuery
+from ..graphops import Adam, Edge, Realization, full_connected_masks
+from .trainer import (
+    PHASE1_BATCH,
+    PHASE1_BATCHES,
+    PHASE2_BATCH,
+    PHASE2_BATCHES,
+    PRUNE_BATCHES,
+    AgentDropoutTrainer,
+    Predict,
+    Reward,
+    Rollout,
+)
 
 
 def acyclic_realization(n: int, alive: set[Edge]) -> set[Edge]:
@@ -94,9 +114,9 @@ class AgentDropoutOptimizer:
         self.temporal_masks: Dict[int, Dict[Edge, int]] = {
             r: {(i, j): ft[i][j] for i, j in all_edges} for r in range(1, self.rounds)}
         self.skip_nodes: Dict[int, int] = {}  # round -> 被整轮淘汰的节点下标
-        self._adam_deg = _Adam(lr)
-        self._adam_s = _Adam(lr)
-        self._adam_t = _Adam(lr)
+        self._adam_deg = Adam(lr)
+        self._adam_s = Adam(lr)
+        self._adam_t = Adam(lr)
         if state_file:
             self.load(state_file)
 
@@ -312,3 +332,135 @@ class AgentDropoutOptimizer:
     def load(self, path: str) -> None:
         with open(path, encoding="utf-8") as f:
             self.load_state_dict(json.load(f))
+
+
+@REGISTRY.register("pre_run_optimizer", "agentdropout")
+class AgentDropoutLG:
+    """AgentDropout 动态节点/边淘汰（LangGraph 统一接口版：apply 单轮语义 / optimize 训练）。
+
+    接缝实现（与 ``pre_run_optimizer/maspo`` 同款形状：注册类在 methods，plugins 只留
+    兼容 shim）——算法（两阶段淘汰训练 / 实现矩阵）全在同包，本类只做两件事：
+
+    - ``mode="apply"``（默认）：视图取节点 → 加载训练状态 → 把第 ``round`` 轮 threshold 实现
+      写回图。AgentDropout 的拓扑是**逐轮不同**的：多轮实验由脚本按轮取 ``realized_matrices(r)``
+      驱动执行；本适配器把指定一轮的通信结构挂到契约图上，并把该轮被淘汰的节点写入
+      ``spec.meta["dropped"]=True``（节点工厂据此让该 agent 本轮不执行，原版输出 'None.'）。
+    - ``mode="optimize"``：按视图节点数建优化器，注入 ``trainset`` / ``rollout`` / ``reward`` /
+      ``predict`` 跑 ``AgentDropoutTrainer`` 的两阶段日程（阶段一 node dropout → 阶段二 edge
+      dropout），产物落 ``state_file``（train_log 落 ``*_train_log.json``）。训练**不消费图**，
+      返回原图；``last_meta`` 记产物摘要（skip_nodes / 准确率 / 剪边事件）供脚本读数。
+      LLM 只经注入回调触达（图由脚本在 rollout 里跑），本类不负重依赖。
+    """
+
+    name = "agentdropout"
+
+    def __init__(self, mode: str = "apply", state_file: Optional[str] = None,
+                 round: int = 0, rounds: int = 2,
+                 trainset: Optional[Sequence[TaskQuery]] = None,
+                 rollout: Optional[Rollout] = None,
+                 reward: Optional[Reward] = None,
+                 predict: Optional[Predict] = None,
+                 lr: float = 0.1, seed: int = 0, pruning_rate: float = 0.10,
+                 phase1_batches: int = PHASE1_BATCHES,
+                 phase1_batch_size: int = PHASE1_BATCH,
+                 phase2_batches: int = PHASE2_BATCHES,
+                 phase2_batch_size: int = PHASE2_BATCH,
+                 prune_batch_idx: Sequence[int] = PRUNE_BATCHES,
+                 train_log_file: Optional[str] = None,
+                 verbose: bool = True, **kwargs: Any) -> None:
+        if mode not in ("apply", "optimize"):
+            raise ValueError(f"未知 mode {mode!r}（apply=挂载训练产物 | optimize=跑训练日程）")
+        self.mode = mode
+        self.state_file = state_file
+        self.round = int(round)
+        self.rounds = int(rounds)
+        self.trainset = trainset
+        self.rollout = rollout
+        self.reward = reward
+        self.predict = predict
+        self.lr = float(lr)
+        self.seed = int(seed)
+        self.pruning_rate = float(pruning_rate)
+        self.phase1_batches = phase1_batches
+        self.phase1_batch_size = phase1_batch_size
+        self.phase2_batches = phase2_batches
+        self.phase2_batch_size = phase2_batch_size
+        self.prune_batch_idx = prune_batch_idx
+        self.train_log_file = train_log_file
+        self.verbose = verbose
+        self.kwargs = dict(kwargs)   # 其余透传 AgentDropoutOptimizer（temperature 等）
+        self.last_meta: Optional[dict] = None
+        self._validate()
+
+    def _validate(self) -> None:
+        """显式报错（不静默忽略/降级）：mode 专属参数错配与训练素材缺失。"""
+        if self.mode == "apply":
+            provided = [n for n, v in (("trainset", self.trainset), ("rollout", self.rollout),
+                                       ("reward", self.reward), ("predict", self.predict))
+                        if v is not None]
+            if provided:
+                raise ValueError(
+                    f"mode=apply 只挂载训练产物，不接受训练素材 {'/'.join(provided)}"
+                    "（跑训练请用 mode=optimize）")
+            return
+        if self.round != 0:
+            raise ValueError(
+                f"mode=optimize 不按轮挂载（round 仅 apply 使用），得到 round={self.round}")
+        if not self.state_file:
+            raise ValueError("mode=optimize 需要 state_file（两阶段训练产物落盘路径）")
+        missing = [n for n, v in (("trainset", self.trainset), ("rollout", self.rollout),
+                                 ("reward", self.reward), ("predict", self.predict))
+                   if v is None]
+        if missing:
+            raise ValueError(
+                f"mode=optimize 需要 {'/'.join(missing)}（trainset: TaskQuery 序列；rollout: "
+                "async (question, plans) -> (final, RolloutStats)；reward: (final, gold) -> "
+                "float；predict: final -> 抽取的预测值）")
+        if not self.trainset:
+            raise ValueError("mode=optimize 的 trainset 为空")
+
+    def optimize(self, graph: Any) -> Any:
+        # 函数内导入避免包内环（graphview 是 plugins 侧，模块级导入会与 plugins.prerun 成环）
+        from ....plugins.prerun.graphview import extract_view, rebuild
+
+        view = extract_view(graph)
+        if self.mode == "optimize":
+            self.last_meta = self._run_trainer(len(view.names))
+            return graph  # 训练不消费图（rollout 自行跑图），返回原图
+
+        opt = AgentDropoutOptimizer(n_agents=len(view.names), rounds=self.rounds,
+                                    lr=self.lr, seed=self.seed,
+                                    state_file=self.state_file, **self.kwargs)
+        sm, tm = opt.realized_matrices(self.round, "threshold")
+        names = view.names
+        dropped = opt.skip_nodes.get(self.round)
+        for i, name in enumerate(names):
+            view.specs[name].meta["dropped"] = (i == dropped)
+        adjacency = {names[i]: [names[j] for j in range(len(names)) if sm[i][j]]
+                     for i in range(len(names))}
+        self.last_meta = {"mode": "apply", "round": self.round, "spatial": sm, "temporal": tm,
+                          "dropped": None if dropped is None else names[dropped],
+                          "skip_nodes": dict(opt.skip_nodes), "names": names}
+        return rebuild(graph, adjacency=adjacency)
+
+    def _run_trainer(self, n_agents: int) -> dict:
+        """mode=optimize：两阶段训练日程（产物写 state_file），返回 last_meta 摘要。"""
+        # state_file=None：训练必须从零起（若把产物路径当输入加载，训练轨迹就被污染了）
+        opt = AgentDropoutOptimizer(n_agents=n_agents, rounds=self.rounds, lr=self.lr,
+                                    seed=self.seed, state_file=None, **self.kwargs)
+        trainer = AgentDropoutTrainer(
+            opt, phase1_batches=self.phase1_batches,
+            phase1_batch_size=self.phase1_batch_size,
+            phase2_batches=self.phase2_batches,
+            phase2_batch_size=self.phase2_batch_size,
+            prune_batch_idx=self.prune_batch_idx,
+            pruning_rate=self.pruning_rate, verbose=self.verbose)
+        report = asyncio.run(trainer.run(self.trainset, self.rollout, self.reward,
+                                         self.predict, state_file=self.state_file,
+                                         train_log_file=self.train_log_file))
+        return {"mode": "optimize", "n_agents": n_agents, "rounds": self.rounds,
+                "state_file": report.state_path, "train_log_file": report.train_log_path,
+                "skip_nodes": {str(r): v for r, v in report.skip_nodes.items()},
+                "phase1_accuracy": report.phase1_accuracy,
+                "phase2_accuracy": report.phase2_accuracy,
+                "prune_events": report.prune_events}

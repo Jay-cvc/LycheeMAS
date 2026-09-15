@@ -83,7 +83,7 @@ sg.add_node(name, node_fn, metadata={"agent_spec": spec})   # spec: core.types.A
 
 - `pre_run_optimizer/maspo`——MASPO 联合提示优化（ICML 2026）：多粒度成对评估（Local/Lookahead/Global 0.4/0.4/0.2，免 gold）+ 错位驱动采样 + 进化 beam search + fixed-rounds 坐标上升 + Beam Refresh；断点续跑（`*_ckpt.json`）。MATH-500 复现：归一化口径 0.78→0.85（+7pt）。
 - `pre_run_optimizer/agentprune`——AgentPrune 时空掩码剪枝（ICLR 2025）：REINFORCE 训练逐边 logit + one-shot 剪枝（训练脚本 `run_agentprune_gsm8k.py`），threshold 确定性实现剪图。
-- `pre_run_optimizer/agentdropout`——AgentDropout 动态节点/边淘汰（ACL 2025）：两阶段——①逐轮加权度 softmax 采样跳过节点 + skip-REINFORCE 训度权重，每轮淘汰最小归一化加权度节点（空间行列 + 跨轮时间边清零）；②逐轮独立参数的边 REINFORCE + one-shot 剪边（训练脚本 `run_agentdropout_gsm8k.py`：5 agents × 2 轮，2×20 题 → node_dropout，4×10 题 + batch 1/3 各剪一次）。拓扑逐轮不同：apply 按 `round=r` 挂载该轮实现，被淘汰节点写 `meta["dropped"]`。
+- `pre_run_optimizer/agentdropout`——AgentDropout 动态节点/边淘汰（ACL 2025）：两阶段——①逐轮加权度 softmax 采样跳过节点 + skip-REINFORCE 训度权重，每轮淘汰最小归一化加权度节点（空间行列 + 跨轮时间边清零）；②逐轮独立参数的边 REINFORCE + one-shot 剪边（日程 = 5 agents × 2 轮，2 batch × 20 题 → node_dropout，4 batch × 10 题 + batch 1/3 各剪一次）。训练循环跟方法走：`mode="optimize"` 由 `methods/prerun/agentdropout/trainer.py::AgentDropoutTrainer` 跑（`trainset` / `rollout` / `reward` / `predict` 由脚本注入，产物落 `state_file` + `*_train_log.json`），`scripts/run_agentdropout_gsm8k.py` 经 `optimize_langgraph(mode="optimize")` 驱动、只提供题池与生成后端（与 MASPO 同一接口面）。拓扑逐轮不同：`mode="apply"` 按 `round=r` 挂载该轮实现，被淘汰节点写 `meta["dropped"]`。接缝实现类（`AgentDropoutLG`：mode 校验 / apply 挂载 / optimize 驱动）与 `maspo` 同款放在 `methods/prerun/agentdropout/optimizer.py`，`plugins/prerun/` 不留实现（`agentdropout_lg.py` 只剩兼容 shim）。
 - `optimizer/gepa`——GEPA 反思式提示演化（`methods/prerun/gepa/`，MASProgram 表示；graph-native 适配待接）。
 
 ### 4.3 memory（运行时记忆，`plugins/memory/` × `methods/memory/`）

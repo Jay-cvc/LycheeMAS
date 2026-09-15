@@ -76,13 +76,13 @@ LycheeMAS/
 ├── src/lychee_mas/
 │   ├── plugins/               ★ 接口层（薄）：五接缝，各自 base.py + __init__.py
 │   │   ├── build/             构建：build_langgraph + AgentSelector/GraphBuilder 协议
-│   │   ├── prerun/            运行前：optimize_langgraph + graphview 节点契约 + 薄适配×2
+│   │   ├── prerun/            运行前：optimize_langgraph + graphview 节点契约 + 薄适配×1
 │   │   ├── memory/            运行时：attach_memory（实现中，显式桩）
 │   │   ├── processing/        执行：run_processed + Processor/Aggregator 协议
 │   │   └── postrun/           运行后：analyze_run + optimize_postrun + train_from_runs
 │   ├── methods/               ★ 实现层（厚，与 plugins 镜像）
 │   │   ├── build/             static 队伍模板、agentinit 选队（Pareto 多样性×相关性）
-│   │   ├── prerun/            agentprune、agentdropout、maspo/、gepa/（+桩）
+│   │   ├── prerun/            agentprune、agentdropout（接缝类+两阶段训练）、maspo/、gepa/（+桩）
 │   │   ├── memory/            channels{nl,latent,c2c} + managers{cdm} + routing + store/context
 │   │   ├── processing/        serial / parallel + self_consistency / aggagent/（+dynamicagg 桩）
 │   │   └── postrun/           attributor·credit 桩 + post_run_optimizer 桩 + TraceStore

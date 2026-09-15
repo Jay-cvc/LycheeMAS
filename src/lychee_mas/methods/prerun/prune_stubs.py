@@ -2,7 +2,8 @@
 
 已实现：
   graph_pruner/agentprune        AgentPrune 时空掩码剪枝（ICLR 2025，见 agentprune.py）
-  graph_pruner/agentdropout      AgentDropout 动态节点/边淘汰（ACL 2025，见 agentdropout.py）
+  graph_pruner/agentdropout      AgentDropout 动态节点/边淘汰（ACL 2025，
+                                 见 agentdropout/optimizer.py）
 
 占位桩（统一报错文案 `<name>: not wired yet (TODO)`，能被 REGISTRY.list 看到）：
   graph_pruner/agentdropout_v2   运行时在线淘汰（AgentDropoutV2，在研）
