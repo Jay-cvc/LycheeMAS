@@ -52,8 +52,8 @@ import agentprune_gsm8k_prompts as P  # noqa: E402  vendored 原版 prompt 资�
 from lychee_mas.core.types import AgentSpec  # noqa: E402
 from lychee_mas.eval import metrics as M  # noqa: E402
 from lychee_mas.eval.benchmarks import load as load_benchmark  # noqa: E402
-from lychee_mas.methods.prerun.agentprune import (  # noqa: E402
-    AgentPrunePruner,
+from lychee_mas.methods.prerun.agentprune import AgentPrunePruner  # noqa: E402
+from lychee_mas.methods.prerun.graphops import (  # noqa: E402
     Realization,
     topological_order,
 )

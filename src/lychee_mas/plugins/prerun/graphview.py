@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ...core.types import AgentSpec
-from ...methods.prerun.agentprune import topological_order
+from ...methods.prerun.graphops import topological_order
 
 
 @dataclass
@@ -140,7 +140,8 @@ def rebuild(graph: Any, *, prompts: Optional[Dict[str, str]] = None,
       metadata 持有同一 spec 对象，这正是不重建节点函数就能换提示的机制）；未知节点名
       显式 KeyError。
     - ``adjacency``：name -> 通信后继名列表（新的通信结构）。产**新** StateGraph：
-      按确定性拓扑序（agentprune 同款 Kahn + 破环）把节点连成线性执行链
+      按确定性拓扑序（methods/prerun/graphops.topological_order：Kahn + 破环）
+      把节点连成线性执行链
       （START → ... → 终端 → END），并把每个节点实际保留的通信前驱写回
       ``spec.meta["predecessors"]``。终端节点保持终端：其出边被忽略。
     - 两者都给：先写提示，再重连边。都不给：原图返回。

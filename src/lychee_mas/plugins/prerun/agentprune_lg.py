@@ -1,6 +1,6 @@
 """pre_run_optimizer/agentprune —— 把既有 graph_pruner/agentprune 接上 LangGraph 统一接口。
 
-薄适配器：算法（logits/masks/threshold 实现）全部复用 ``layers/prune/pruners/agentprune.py``，
+薄适配器：算法（logits/masks/threshold 实现）全部复用 ``methods/prerun/agentprune.py``，
 本类只做「视图取邻接 → threshold 实现矩阵 → rebuild 写回」。与 MASGraph 路径
 （``pre_run_plugin/prune`` + ``AgentPrunePruner.prune``）语义一致，测试对拍见
 ``tests/test_prerun.py``。
